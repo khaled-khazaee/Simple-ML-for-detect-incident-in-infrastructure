@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 # -----------------------------
 def generate_synthetic_metrics(n_points: int = 2000, seed: int = 42) -> pd.DataFrame:
     """
-    Create synthetic "normal" system metrics that look realistic enough for a demo.
+    Create synthetic "normal" system metrics for a demo.
     """
     rng = np.random.default_rng(seed)
     t = np.arange(n_points)
@@ -21,7 +21,7 @@ def generate_synthetic_metrics(n_points: int = 2000, seed: int = 42) -> pd.DataF
     err5xx = rng.poisson(0.2, n_points).astype(float)
     latency = 80 + 10 * np.sin(t / 45) + rng.normal(0, 4.0, n_points)
 
-    df = pd.DataFrame(
+    return pd.DataFrame(
         {
             "t": t,
             "cpu": cpu,
@@ -31,7 +31,6 @@ def generate_synthetic_metrics(n_points: int = 2000, seed: int = 42) -> pd.DataF
             "latency_ms": latency,
         }
     )
-    return df
 
 
 def inject_incidents(df: pd.DataFrame, seed: int = 123) -> tuple[pd.DataFrame, list[tuple[int, int, str]]]:
@@ -44,7 +43,7 @@ def inject_incidents(df: pd.DataFrame, seed: int = 123) -> tuple[pd.DataFrame, l
     rng = np.random.default_rng(seed)
     df = df.copy()
 
-    windows = []
+    windows: list[tuple[int, int, str]] = []
 
     # Incident A: backend trouble -> latency + 5xx jump
     a_start, a_end = 700, 820
@@ -75,7 +74,7 @@ def train_isolation_forest(train_df: pd.DataFrame, feature_cols: list[str]) -> I
     """
     model = IsolationForest(
         n_estimators=300,
-        contamination=0.01,  # lower sensitivity than before
+        contamination=0.01,  # lower sensitivity than the very first version
         random_state=42,
     )
     model.fit(train_df[feature_cols])
@@ -96,27 +95,26 @@ def score_points(model: IsolationForest, df: pd.DataFrame, feature_cols: list[st
 
 
 # -----------------------------
-# Incident confirmation logic
+# Incident confirmation logic (Option A)
 # -----------------------------
 def confirm_incidents(
     df: pd.DataFrame,
-    min_consecutive: int = 10,
-    min_score: float = 0.10,
+    min_consecutive: int = 5,
+    min_score: float = 0.05,
 ) -> pd.DataFrame:
     """
-    Convert noisy point anomalies into "confirmed incident" events.
+    Convert noisy point anomalies into "confirmed incident points".
 
-    Rules:
-      1) A point must be flagged by the model (is_anomaly_raw == True)
-      2) And its score must be above min_score (extra filter)
-      3) Then we require min_consecutive points in a row to confirm an incident
+    A point becomes a confirmed incident point only if:
+      1) The model flags it as anomalous
+      2) The anomaly score is strong enough (min_score)
+      3) The condition persists for at least min_consecutive points
     """
     df = df.copy()
 
     strong = df["is_anomaly_raw"] & (df["anomaly_score"] >= min_score)
     df["is_anomaly_strong"] = strong
 
-    # Find consecutive runs of True values
     run_id = (strong != strong.shift(1, fill_value=False)).cumsum()
     run_lengths = strong.groupby(run_id).transform("sum")
 
@@ -131,21 +129,21 @@ def extract_incident_windows(df: pd.DataFrame) -> list[tuple[int, int]]:
     incident = df["is_incident_point"].to_numpy()
     t = df["t"].to_numpy()
 
-    windows = []
+    windows: list[tuple[int, int]] = []
     in_run = False
-    start_t = None
+    start_t = 0
 
     for i, flag in enumerate(incident):
         if flag and not in_run:
             in_run = True
-            start_t = t[i]
+            start_t = int(t[i])
         elif not flag and in_run:
-            end_t = t[i - 1]
-            windows.append((int(start_t), int(end_t)))
+            end_t = int(t[i - 1])
+            windows.append((start_t, end_t))
             in_run = False
 
     if in_run:
-        windows.append((int(start_t), int(t[-1])))
+        windows.append((start_t, int(t[-1])))
 
     return windows
 
@@ -155,12 +153,12 @@ def extract_incident_windows(df: pd.DataFrame) -> list[tuple[int, int]]:
 # -----------------------------
 def collect_evidence_for_window(df: pd.DataFrame, start: int, end: int) -> dict:
     """
-    In a real system, this is where you'd run commands and collect logs/metrics.
-    Here we simulate evidence using the metrics around the incident window.
+    Simulate evidence collection using metrics around the incident window.
+    In a real system, this would run commands and fetch logs/metrics.
     """
     slice_df = df[(df["t"] >= start) & (df["t"] <= end)].copy()
 
-    evidence = {
+    return {
         "window": {"start": start, "end": end, "duration_points": int(end - start + 1)},
         "summary": {
             "cpu_max": float(slice_df["cpu"].max()),
@@ -174,16 +172,15 @@ def collect_evidence_for_window(df: pd.DataFrame, start: int, end: int) -> dict:
         "recommended_next_steps": [
             "Fetch service logs around the window (e.g., nginx/app logs).",
             "Check recent deployments or configuration changes.",
-            "Inspect resource usage per process (top/htop), and open file descriptors.",
-            "If safe, run a non-destructive health check to confirm impact.",
+            "Inspect resource usage per process and open file descriptors.",
+            "Run a non-destructive health check to confirm impact before remediation.",
         ],
     }
-    return evidence
 
 
 def write_incident_events_jsonl(events: list[dict], path: str = "incident_events.jsonl") -> None:
     """
-    Append incident events to a JSONL file (one JSON object per line).
+    Write incident events to a JSONL file (one JSON object per line).
     """
     with open(path, "w", encoding="utf-8") as f:
         for e in events:
@@ -199,41 +196,36 @@ def plot_dashboard(
     detected_windows: list[tuple[int, int]],
 ) -> None:
     """
-    A cleaner plot:
+    Display a clearer interactive dashboard:
       - Separate charts for CPU, latency, and 5xx errors
       - Ground-truth incidents shaded lightly
       - Detected incidents shaded more prominently
+      - Confirmed incident points marked with X on the latency chart
     """
     fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
 
-    # 1) CPU
     axes[0].plot(df["t"], df["cpu"], label="cpu (%)")
     axes[0].set_ylabel("CPU (%)")
     axes[0].grid(True, alpha=0.3)
 
-    # 2) Latency
     axes[1].plot(df["t"], df["latency_ms"], label="latency (ms)")
     axes[1].set_ylabel("Latency (ms)")
     axes[1].grid(True, alpha=0.3)
 
-    # 3) 5xx
     axes[2].plot(df["t"], df["err5xx"], label="5xx errors")
     axes[2].set_ylabel("5xx")
     axes[2].set_xlabel("time step")
     axes[2].grid(True, alpha=0.3)
 
-    # Shade ground-truth incident windows
     for start, end, label in ground_truth_windows:
         for ax in axes:
             ax.axvspan(start, end, alpha=0.10)
         axes[0].text(start, axes[0].get_ylim()[1] * 0.95, label, fontsize=9, va="top")
 
-    # Shade detected incident windows
     for start, end in detected_windows:
         for ax in axes:
             ax.axvspan(start, end, alpha=0.25)
 
-    # Mark incident points (confirmed) on the latency chart
     incident_points = df[df["is_incident_point"]]
     axes[1].scatter(
         incident_points["t"],
@@ -241,8 +233,8 @@ def plot_dashboard(
         marker="x",
         label="confirmed incident points",
     )
-
     axes[1].legend(loc="upper right")
+
     fig.suptitle("Synthetic Monitoring Dashboard (Ground Truth vs Detected Incidents)")
     plt.tight_layout()
     plt.show()
@@ -251,55 +243,48 @@ def plot_dashboard(
 # -----------------------------
 # Main
 # -----------------------------
-def main():
+def main() -> None:
     feature_cols = ["cpu", "ram", "disk", "err5xx", "latency_ms"]
 
-    # 1) Create normal data and a test set with incidents
     df_normal = generate_synthetic_metrics(n_points=2000, seed=42)
     df_test, gt_windows = inject_incidents(df_normal, seed=123)
 
-    # 2) Train on an early "normal-only" slice
     train_df = df_test.iloc[:600].copy()
     model = train_isolation_forest(train_df, feature_cols)
 
-    # 3) Score each time step
     scored = score_points(model, df_test, feature_cols)
 
-    # 4) Confirm incidents using duration + score filters
     scored = confirm_incidents(
         scored,
-        min_consecutive=10,  # must persist for at least 10 points
-        min_score=0.10,      # extra threshold to reduce sensitivity
+        min_consecutive=5,  # Option A: softer duration requirement
+        min_score=0.05,     # Option A: softer score threshold
     )
 
     detected_windows = extract_incident_windows(scored)
 
-    # 5) Save scored data for inspection
-    scored.to_csv("scored_metrics_v2.csv", index=False)
+    scored.to_csv("scored_metrics_v3.csv", index=False)
 
-    # 6) If incident confirmed -> collect evidence (demo) and write JSONL
-    events = []
+    events: list[dict] = []
     for i, (start, end) in enumerate(detected_windows, start=1):
         evidence = collect_evidence_for_window(scored, start, end)
-        event = {
-            "incident_id": f"INC-{i:04d}",
-            "type": "anomaly_detected",
-            "evidence": evidence,
-        }
-        events.append(event)
+        events.append(
+            {
+                "incident_id": f"INC-{i:04d}",
+                "type": "anomaly_detected",
+                "evidence": evidence,
+            }
+        )
 
     write_incident_events_jsonl(events, path="incident_events.jsonl")
 
-    # 7) Print a short summary
     print(f"Detected incident windows: {len(detected_windows)}")
-    for w in detected_windows:
-        print(f"  - start={w[0]}, end={w[1]}, duration_points={w[1]-w[0]+1}")
+    for start, end in detected_windows:
+        print(f"  - start={start}, end={end}, duration_points={end - start + 1}")
 
     print("\nSaved files:")
-    print("  - scored_metrics_v2.csv")
+    print("  - scored_metrics_v3.csv")
     print("  - incident_events.jsonl")
 
-    # 8) Plot a cleaner dashboard
     plot_dashboard(scored, gt_windows, detected_windows)
 
 
